@@ -1,8 +1,25 @@
-# Swing Trader AI — Complete Architecture Blueprint
+# Swing Trader AI — Complete Architecture Blueprint (v5)
 
 > **Target:** Personal use · Zerodha Kite · Next.js + TypeScript · Claude API
 > **Philosophy:** Solid foundation, built to expand. Human approves, agent executes.
-> **Signal approach:** Hybrid — 10 orthogonal scalar indicators (fast, free, runs on all 500 stocks) ratified by Vision AI chart analysis (slow, paid, runs only on shortlisted setups).
+> **Signal approach:** Hybrid — 10 orthogonal scalar indicators (fast, free, runs on watchlist stocks nightly and NSE 500 on Sundays) ratified by Vision AI chart analysis (slow, paid, runs only on shortlisted setups).
+
+> **What changed from v4 (trading-hardening pass):** Every number introduced here is a
+> **backtest seed, not a final value** — the Strategy Lab (§20.6) calibrates them; the
+> *structure* is fixed, the *constants* are starting points.
+> - **§15 Indicator (Confidence) Score** — the previously-undefined core formula that
+>   `finalScore` depends on, now specified as a pure, setup-type-weighted function.
+> - **§7 Agent 1 + Workflow 2** — the Regime Agent now **hard-gates** new longs (risk-off
+>   blocks entries; neutral halves risk and raises the morning threshold) instead of being
+>   informational only.
+> - **Workflow 1 + §15 Exit Policy** — staged exit: breakeven at +1R, partial at T1, ATR/swing
+>   trail on the runner, time stop. Replaces v4's loose single-trail.
+> - **§14 SL GTT** — corrected from `MARKET` (Kite GTT does **not** support market orders;
+>   it executes a LIMIT on trigger) to a **buffered LIMIT** that fills through gap-downs, plus a
+>   30-minute SL-presence assertion in the News Agent so no position sits unprotected.
+> - **§7 Agent 2b** — continuous Vision veto (removes the v4 score discontinuity at Vision = 40)
+>   and Vision treated as veto-first until its accuracy is backtested.
+> - **§20** — portfolio-heat independence caveat and a correlated-theme cap.
 
 ---
 
@@ -27,48 +44,77 @@
 17. [Build and Run](#17-build-and-run)
 18. [Phase-wise Development Plan](#18-phase-wise-development-plan)
 19. [Key Design Decisions and Rationale](#19-key-design-decisions-and-rationale)
-
+20. [Risk Policy & Performance Targets](#20-risk-policy--performance-targets)
 ---
 
 ## 1. Big Picture Mental Model
 
-Before any code, understand the **core loop** this app automates:
+Before any code, understand that the app manages **three distinct groups of stocks**
+and automates **two rhythms** — a weekly cycle and a daily cycle.
+
+### 1.1 Three Stock Groups
+
+At any point during the week, the trader has three categories of stocks:
+
+| Group | What it is | Scanner behaviour | Score computed |
+|---|---|---|---|
+| Group 1 — Open positions | Stocks you currently hold a trade on | Excluded from setup detection. EOD position review: trailing SL, target assessment | No Watchlist Score (irrelevant while holding) |
+| Group 2 — Active watchlist | Stocks you are watching for setups, with a structural hypothesis written | Scanned nightly for actionable setups (Mon–Fri) | Watchlist Score nightly |
+| Group 3 — NSE 500 universe | The broader universe, not on your watchlist | Scanned weekly on Sunday for structural discovery. Not scanned for setups on weekdays. Volume-spike discovery alert only (Mon–Fri) | Watchlist Score on Sunday scan only |
+
+Stocks move between groups automatically:
+- Group 2 → Group 1: when an entry GTT triggers (trade opens)
+- Group 1 → Group 2: when a trade closes (SL, target, or manual exit) — with a 1-day cooldown before the scanner evaluates it again
+- Group 3 → Group 2: when you accept a Sunday proposal and add it to your watchlist
+- Group 2 → Group 3: when you remove a stock from your watchlist
+
+### 1.2 The Two Rhythms
 
 ```
-EVERY EVENING (after 3:30 PM IST)
-  Token Health Check — verify Kite access_token is valid
-  Data Agent pulls OHLCV for NSE 500 stocks
-  Indicator Engine computes 10 orthogonal indicators per stock   ← fast, free
-  Regime Agent classifies market condition
-  Scanner Agent scores every stock → shortlist (~15–25 setups)
-  Vision Agent renders charts for shortlist → ratifies each setup ← slow, paid
-  Plan Agent drafts 2–3 line hypothesis for each setup           ← NEW
-  Briefing Agent writes your evening summary
-  Watchlist Score recomputed for all watchlist stocks            ← NEW
+WEEKLY RHYTHM — Sunday
 
-YOU review Vision-ratified shortlist → read agent hypothesis → edit if needed
-→ approve trade plans
+  Sunday morning (automatic):
+    Sunday scanner runs on full NSE 500 using Friday's weekly candle
+    Computes Watchlist Score for all 500 stocks
+    Filters out: already on watchlist, open positions, hard filter failures
+    Produces 20–30 "Weekly Proposals" ranked by score
 
-NEXT MORNING (8:45 AM IST, before market open)
-  Token Health Check — alert if re-auth needed
-  Briefing Agent fetches global cues, events, FII data
-  Pre-Market Staleness Check on all pending setups               ← NEW
-  Morning Readiness Score computed for each candidate            ← NEW
-  You review morning brief + readiness scores
+  Sunday evening (you):
+    Open Watchlist → review proposals → add stocks; agent drafts structural hypotheses for each
+    Edit or confirm the hypothesis text if needed
+    Open Weekly Review → performance, discipline score, regime breakdown
+    Goal: end with 15–30 active watchlist stocks, each with a thesis
 
-DURING MARKET HOURS
-  9:15 AM — News Agent first pass: opening gap check on gtt_placed setups
-             Cancel GTT + mark expired if stock opened outside entry zone
-  Every 30 min — News Agent: BSE announcements for open positions,
-                              gtt_placed setups, watchlist stocks
-  Real-time — Kite GTT postback webhook: entry/SL execution → DB update
-              + immediate SL GTT placement on entry + Telegram alert
-  3:35 PM — Order Reconciliation: safety net for missed postbacks
+DAILY RHYTHM — Monday through Friday
 
-WEEKLY (Sunday)
-  Journal Agent reviews all closed trades
-  Generates win rate, R:R analysis, mistake patterns
-  Evaluates: was the hypothesis still intact at entry/exit?      ← NEW
+  Evening (after 3:45 PM, automated + you):
+    EOD Position Review for Group 1 — trailing SL, target suggestions
+    Data fetch + indicators for Group 2 watchlist stocks only
+    Regime Agent classifies market condition
+    Scanner Agent scores watchlist stocks → shortlist (~3–8 setups)
+    Vision Agent ratifies shortlist → finalScore computed
+    Volume-spike discovery screener on NSE 500 → alert-only, not candidates
+    Plan Agent drafts hypothesis for each setup
+    Watchlist Score recomputed for Group 2 stocks
+    Briefing Agent writes evening summary
+    → You review candidates, edit hypotheses, confirm plans
+
+  Morning (8:45 AM, automated + you):
+    Token Health Check — alert if re-auth needed
+    Pre-Market Staleness Check on all plan_confirmed setups
+    Morning Readiness Score computed for each
+    GTT placed automatically for setups passing threshold
+    Stale/held setups flagged for manual review
+    → You review morning brief, act on held setups if needed
+
+  During market hours (automated, lean):
+    9:15 AM — News Agent first pass: cancel GTT if stock opened outside entry zone
+    Every 30 min — News Agent: BSE announcements for Group 1 + Group 2
+    Real-time — Kite GTT postback: entry → SL GTT placed, SL hit → trade closed
+    3:35 PM — Order Reconciliation: safety net for missed postbacks
+
+  Evening (3:45 PM, the cycle repeats):
+    EOD position review + new scan for tomorrow
 ```
 
 **The human is always in the approval seat.** The agent never places orders without your confirmation. This is both a safety design and compliant with SEBI's retail algo trading rules.
@@ -186,7 +232,8 @@ swing-trader/
 │   ├── jobs/
 │   │   ├── queue.ts
 │   │   ├── workers/
-│   │   │   ├── eod-scan.worker.ts         # UPDATED — includes EOD position review
+│   │   │   ├── eod-scan.worker.ts         # Watchlist only + EOD position review + volume spike
+│   │   │   ├── sunday-scan.worker.ts      # NSE 500 weekly discovery scan
 │   │   │   ├── morning-brief.worker.ts    # UPDATED — staleness check + MR score + GTT placement
 │   │   │   ├── news-agent.worker.ts       # 30-min intraday + 9:15 AM gap check (replaces monitor)
 │   │   │   ├── journal.worker.ts
@@ -356,7 +403,24 @@ model WatchlistItem {
   instrumentId     String
   instrument       Instrument @relation(fields: [instrumentId], references: [id])
   addedAt          DateTime   @default(now())
-  isActive         Boolean    @default(true)
+
+  // Lifecycle status — controls scanner and score behaviour.
+  // Transitions are automatic except for manual add/remove/snooze.
+  status           String     @default("active")
+  // Statuses:
+  //   active       — monitoring for setups, Watchlist Score computed nightly
+  //                  Scanner evaluates this stock for entry setups (Mon–Fri)
+  //   in_trade     — position open on this stock, excluded from scanner
+  //                  Watchlist Score computation paused
+  //                  Managed by EOD position review instead
+  //   cooldown     — trade just closed, 1-day scanner cooldown active
+  //                  Prevents revenge-trading the same stock
+  //                  Auto-transitions to "active" after cooldownUntil date
+  //   snoozed      — temporarily excluded (set during Sunday curation)
+  //                  Auto-transitions to "active" after snoozeUntil date
+
+  cooldownUntil    DateTime?  // null unless status = "cooldown"
+  snoozeUntil      DateTime?  // null unless status = "snoozed"
 
   // Structural thesis — written and owned by you (1–3 sentences).
   // Explains WHY this stock is on your watchlist at the macro/
@@ -364,7 +428,9 @@ model WatchlistItem {
   hypothesis       String?
   hypothesisUpdatedAt DateTime?
 
-  // Composite watchlist score (0–100), recomputed every evening.
+  // Composite watchlist score (0–100).
+  // Computed nightly for status = "active" stocks.
+  // Computed for all NSE 500 on Sunday morning (discovery scan).
   // Components: weekly trend strength (40%) + RS vs Nifty (30%)
   // + setup readiness proximity (30%).
   watchlistScore        Float?     // 0–100
@@ -383,7 +449,8 @@ model Setup {
   timeframe       String
   confidenceScore Float      // 0–100, from scalar indicators
   visionScore     Float?     // 0–100, from Vision AI ratification
-  finalScore      Float?     // 0.6 * indicatorScore + 0.4 * visionScore
+  finalScore      Float?     // computeFinalScore(): (0.6·indicator + 0.4·vision) scaled by a
+                             // continuous Vision veto below 40 (§7 Agent 2b) — no hard cliff
 
   // Morning Readiness Score — computed at 8:45 AM the next day.
   // Separate from finalScore so you can always see the original
@@ -415,8 +482,11 @@ model Setup {
   //   plan_confirmed       — you confirmed/edited hypothesis (evening gate passed)
   //                          Morning Readiness Score not yet computed
   //   gtt_placed           — morning score reviewed, entry GTT live at Kite
-  //   expired              — morning veto OR stock opened outside entry zone at 9:15 AM
-  //   stale_pending_review — morning score dropped > 20 pts, needs manual review
+  //   expired              — stock opened outside entry zone at 9:15 AM (real price check)
+  //   stale_pending_review — held for manual review at the morning gate. Set when ANY of:
+  //                          risk-off regime, BSE/NSE hard veto, or MR score below
+  //                          policy.mrThreshold. The reason is recorded in morningScoreDetail.
+  //                          (NOT auto-expired — you can still place the GTT manually.)
   //   traded               — entry GTT triggered, linked Trade record created
   //   rejected             — you explicitly skipped this setup
 
@@ -437,7 +507,9 @@ model TradePlan {
   target3         Float?
   quantity        Int
   riskAmount      Float
-  riskRewardRatio Float
+  riskRewardRatio Float    // R:R of Target 1 (the gating target — must be >= 1.5, §20.5)
+  atr14           Float    // ATR(14) from the entry snapshot — used to size the buffered
+                           // SL-GTT limit (§14) and the ATR trail (§15 Exit Policy)
   agentReasoning  String
   status          String   @default("pending")
   // Statuses:
@@ -466,7 +538,7 @@ model Trade {
   side            String    // "BUY" or "SELL"
   exitDate        DateTime?
   exitPrice       Float?
-  exitReason      String?   // "target1" | "target2" | "stoploss" | "manual" | "trailing_sl"
+  exitReason      String?   // "target1" | "target2" | "stoploss" | "manual" | "trailing_sl" | "breakeven" | "time_stop"
   realizedPnl     Float?
   status          String    @default("open")
   // Statuses:
@@ -477,6 +549,8 @@ model Trade {
   //   partial            — partially exited (some quantity remains open)
   stopLoss        Float
   currentSL       Float     // updated as trailing SL moves
+  atr14           Float     // refreshed from the latest daily snapshot; drives the buffered
+                            // SL-GTT limit and the ATR trail (kept current by the EOD review)
   target1         Float
   target2         Float?
   journalEntry    JournalEntry?
@@ -494,7 +568,7 @@ model TradeExit {
   exitDate    DateTime
   exitPrice   Float
   quantity    Int
-  exitReason  String   // "target1" | "target2" | "stoploss" | "manual" | "trailing_sl"
+  exitReason  String   // "target1" | "target2" | "stoploss" | "manual" | "trailing_sl" | "breakeven" | "time_stop"
   realizedPnl Float
   createdAt   DateTime @default(now())
 }
@@ -543,6 +617,25 @@ model Alert {
   createdAt    DateTime @default(now())
   isRead       Boolean  @default(false)
   sentToTelegram Boolean @default(false)
+}
+
+// ── Weekly Proposals ──────────────────────────────────────────
+// Generated by the Sunday scanner. Stores NSE 500 stocks ranked
+// by Watchlist Score that are not already on the trader's watchlist.
+// The trader reviews these on Sunday evening and adds selected ones.
+
+model WeeklyProposal {
+  id               Int        @id @default(autoincrement())
+  instrumentId     String
+  scanDate         DateTime   // Sunday of this scan
+  watchlistScore   Float      // 0–100 composite
+  scoreDetail      Json       // sub-score breakdown
+  weeklyTrend      String     // "up" | "down" | "sideways"
+  rsVsNifty        Float      // e.g. 1.14
+  proximityReason  String     // "BB compressed, RSI cooling" or "no proximity signals"
+  status           String     @default("pending")
+  // Statuses: pending | accepted | rejected | snoozed
+  createdAt        DateTime   @default(now())
 }
 ```
 
@@ -655,14 +748,54 @@ export async function runAgent({
 }
 ```
 
+**Regime gate (v5) — the report is now a control, not just a paragraph.** Taking long swing
+setups while Nifty is below its 200-EMA with rising downside ADX is the highest-frequency way a
+swing account draws down. The regime classification therefore **gates entries** (consumed by
+Workflow 2 morning placement and by the Plan Agent):
+
+```typescript
+// src/scoring/regime-gate.ts
+type Regime = "risk_on" | "neutral" | "risk_off";
+
+export function classifyRegime(r: RegimeReport, niftyVs200ema: number): Regime {
+  // niftyVs200ema = (niftyClose - nifty200ema) / nifty200ema * 100
+  if (r.trend === "down" && niftyVs200ema < -1 && r.strength >= 20) return "risk_off";
+  if (r.trend === "up"   && niftyVs200ema > 1  && r.vixLevel < 18)  return "risk_on";
+  return "neutral";
+}
+
+// SEED values — backtest before trusting.
+export const REGIME_POLICY: Record<Regime, {
+  allowNewLongs: boolean; riskMultiplier: number; maxOpenPositions: number; mrThreshold: number;
+}> = {
+  risk_on:  { allowNewLongs: true,  riskMultiplier: 1.0, maxOpenPositions: 8, mrThreshold: 50 },
+  neutral:  { allowNewLongs: true,  riskMultiplier: 0.5, maxOpenPositions: 5, mrThreshold: 60 },
+  risk_off: { allowNewLongs: false, riskMultiplier: 0.0, maxOpenPositions: 0, mrThreshold: 999 }, // caps moot — no new longs
+};
+```
+
+**The asymmetry that matters:** `risk_off` blocks only *new* longs. The EOD position review still
+trails and manages *existing* trades. In a bear market you defend; you do not open. The regime
+gate is also the primary defense against correlated portfolio risk (§20.2) — it cuts exposure
+*before* the correlated gap-down day arrives, rather than relying on per-trade stops to hold.
+
 ---
 
 ### Agent 2: Scanner Agent
-**Runs:** Every evening after 3:45 PM IST
-**Purpose:** Scans NSE 500 + watchlist for valid swing setups using 10 orthogonal indicators. Returns a shortlist ranked by indicator confidence score.
+**Runs:** Every evening after 3:45 PM IST (Mon–Fri)
+**Purpose:** Scans **active watchlist stocks only** (Group 2) for valid swing
+setups using 10 orthogonal indicators. Does NOT scan the full NSE 500 on
+weekdays — that is the Sunday scanner's job. Returns a shortlist ranked by
+indicator confidence score.
+
+**Stocks excluded from the scan:**
+- Group 1: open positions (already in a trade — managed by EOD position review)
+- Stocks with status "in_trade" on the WatchlistItem
+- Stocks with status "cooldown" where cooldownUntil > today
+- Stocks with status "snoozed" where snoozeUntil > today
 
 **Tools it uses:**
-- `get_instrument_list(universe)`
+- `get_active_watchlist()` — returns instruments with WatchlistItem.status = "active"
 - `get_ohlcv(symbol, timeframe, days)`
 - `compute_indicators(symbol, timeframe)`
 - `check_fno_ban(symbol)`
@@ -781,12 +914,25 @@ export const VisionVerdictSchema = z.object({
 export type VisionVerdict = z.infer<typeof VisionVerdictSchema>;
 ```
 
-**Score blending (unchanged):**
+**Score blending (v5 — continuous Vision veto):**
+
+Vision is weighted at 40% of the entry decision, yet it is the one signal with no backtest
+behind it. Two safeguards apply until Phase 4 measures Vision accuracy per score decile (§20.6):
+
+- The veto is **continuous**, not a hard branch. A one-point change in a subjective Vision
+  score must not swing the final score by ~45 points — the v4 formula jumped from 19.5 to 64
+  at the 39/40 boundary for an indicator score of 80. Below 40, the whole score scales smoothly
+  toward 0.
+- Treat Vision as **veto-first**: it can sink a setup, but until validated it should not
+  manufacture conviction the indicators do not support.
 
 ```typescript
 function computeFinalScore(indicatorScore: number, visionScore: number): number {
-  if (visionScore < 40) return visionScore * 0.5;
-  return (indicatorScore * 0.6) + (visionScore * 0.4);
+  const base = indicatorScore * 0.6 + visionScore * 0.4;
+  // Continuous veto: below 40, scale the whole score down smoothly toward 0
+  // (no discontinuity at the boundary). At/above 40, full blend.
+  const vetoFactor = visionScore >= 40 ? 1 : visionScore / 40;
+  return base * vetoFactor;
 }
 ```
 
@@ -875,12 +1021,17 @@ Hypothesis (agent-drafted):
   watchlist thesis was waiting for. Invalidated if price opens below ₹798
   (original swing low) or if Nifty gaps down more than 1.5% tomorrow."
 
-Entry Zone: ₹820 – ₹828
-Stop Loss:  ₹798 (below Aug 14 swing low, 2.8% risk)
-Target 1:   ₹865 (1:1.6 R:R)
-Target 2:   ₹910 (1:3.4 R:R)
+Entry Zone: ₹820 – ₹828   (buy-stop fills at the zone high, ₹828 — all
+                           risk/R:R below is computed from the ₹828 fill)
+Stop Loss:  ₹798 (below Aug 14 swing low; ₹30/share = 3.6% risk)
+Target 1:   ₹888 (1:2.0 R:R)
+Target 2:   ₹930 (1:3.4 R:R)
 Quantity:   36 shares
-Risk:       ₹1,080 (1% of ₹1,08,000 capital)
+Risk:       ₹1,080 (36 × ₹30 = 1% of ₹1,08,000 capital)
+
+Note: every plan number is pinned to the GTT fill reference (entryZoneHigh = ₹828).
+T1 R:R = (888−828)/30 = 2.0, clearing the §20.5 minimum of 1.5. A plan whose T1 R:R
+falls below 1.5 at the fill price is rejected by the Plan Agent before it reaches you.
 
 Portfolio check:
   Current Auto sector exposure: 18% of deployed capital
@@ -904,12 +1055,94 @@ if (newSectorPct > SECTOR_CAP_PCT) {
 }
 ```
 
+**Stop-distance guard and regime sizing (v5):**
+
+Risk-based sizing off the SL distance is correct (1R discipline), but it needs guard rails, and
+it must respect the regime gate:
+
+```typescript
+// 1. Floor + ceiling on stop distance (before computing quantity).
+//    A too-tight stop creates an oversized position a normal wiggle stops out;
+//    a too-wide stop is no longer a swing trade.
+const atr = snapshot.volatility.atr14;
+const structuralStop = setupStructuralStop;           // swing low / pattern low
+const minStop = Math.max(structuralStop, entry - 1.5 * atr);  // floor at 1.5·ATR
+const stopDistancePct = ((entry - minStop) / entry) * 100;
+if (stopDistancePct > 8) {
+  agentReasoning += `\n⚠ Stop ${stopDistancePct.toFixed(1)}% away — too wide for a swing ` +
+    `trade. Flagged for manual review; consider skipping.`;
+}
+
+// 2. Regime risk multiplier (from §7 Agent 1 regime gate).
+const policy = REGIME_POLICY[currentRegime];
+const effectiveRiskPct = RISK_CONFIG.RISK_PER_TRADE_PCT * policy.riskMultiplier;
+// risk_off → multiplier 0 → Plan Agent refuses the plan (no new longs).
+if (!policy.allowNewLongs) {
+  return refusePlan("Risk-off regime — new longs disabled. Manage existing positions only.");
+}
+
+// 3. Quantity from the guarded stop and the regime-adjusted risk.
+const quantity = calculatePositionSize(entry, minStop, effectiveRiskPct, capital);
+```
+
+**Entry-trigger note (per setup type):** the GTT entry mechanism should match the setup. A
+buy-stop *through* the zone high suits breakouts and reclaim-pullbacks; a "buy the dip at
+support" pullback wants a buy-limit nearer the zone low. Parameterize the entry trigger by
+`setupType` rather than using one global `price >= entryZoneHigh` rule (see §14).
+
 **UI gate — hypothesis required before plan approval:**
 
 The Plan Approval UI (`TradePlanCard.tsx`) blocks the "Approve" button until `setupHypothesis` is non-empty. The hypothesis field is editable inline. If you agree with the agent's draft, leave it as-is. If not, edit it to reflect your actual conviction. The `hypothesisEditedByUser` flag records whether you changed it.
 
 ---
+### Agent 3b: Watchlist Hypothesis Agent (NEW)
 
+**Runs:** On-demand, when you accept a Weekly Proposal and add a stock to your watchlist  
+**Purpose:** Drafts a 1–3 sentence **structural hypothesis** for each new watchlist stock, explaining why it deserves attention over the next few weeks. You can edit or overwrite this draft before saving.
+
+**Inputs:**
+
+- `WeeklyProposal` record:
+  - `instrumentId`
+  - `weeklyTrend` (“up” | “down” | “sideways”)
+  - `watchlistScore`, `scoreDetail`
+  - `rsVsNifty`
+  - `proximityReason` (e.g. “BB compressed, RSI cooling”)[file:1]
+- `Instrument` metadata:
+  - `name`, `sector`, `isFnO`[file:1]
+- Optional:
+  - Last 10–20 weekly candles (for context only)
+  - Recent BSE announcements, if any, for soft fundamental color
+
+**Tools it uses:**
+
+- `get_weekly_proposal(id)` – fetches proposal details for the selected stock
+- `get_instrument_metadata(instrumentId)` – name, sector, F&O flag
+- `get_weekly_ohlcv(symbol, weeks)` – optional context only
+- `get_recent_bse_news(symbol, days)` – optional, for structural context
+- `save_watchlist_hypothesis(instrumentId, hypothesis)` – writes to `WatchlistItem.hypothesis` and updates `hypothesisUpdatedAt`[file:1]
+
+**Output:**
+
+A short JSON object persisted via `save_watchlist_hypothesis`:
+
+```ts
+{
+  instrumentId: string,
+  hypothesis: string,         // 2–3 sentences, structural, weekly timeframe
+  source: "agent_drafted",    // vs "manual"
+  updatedAt: Date
+}
+```
+
+The system prompt instructs the agent to:
+
+- Stay **structural and weekly‑timeframe**, not day‑trade specific.
+- Use `weeklyTrend`, `rsVsNifty`, and `proximityReason` to justify why the stock is worth watching now.
+- Mention clear **remove conditions** in plain language (e.g., “If the weekly uptrend breaks and RS vs Nifty falls back below 1.0 for several weeks, this thesis is invalid.”).
+- Avoid proposing any immediate entry; concrete trade setups are handled later by Scanner + Plan Agent.
+
+In the UI, the hypothesis appears in an editable text area on the “Add to Watchlist” confirmation dialog. The watchlist entry is only saved once the hypothesis field is non‑empty (either agent‑drafted or manually edited).
 ### Agent 4: News Agent (sole intraday agent)
 **Runs:** Every 30 minutes during market hours (9:15 AM – 3:30 PM IST)
 **Purpose:** The only agent running during market hours. Monitors BSE/NSE
@@ -947,6 +1180,34 @@ HIGH impact on gtt_placed setup → Telegram alert, status → "stale_pending_re
                                    (GTT NOT auto-cancelled — you decide)
 MEDIUM/LOW → log to DB, include in evening briefing
 ```
+
+**SL-presence assertion (v5 — closes the unprotected-position window):**
+The postback that places an SL on entry can be missed. Relying on the 3:35 PM reconciliation as
+the only backstop leaves a position unprotected for up to ~6 hours. The News Agent already polls
+every 30 minutes, so it asserts protection on every pass — shrinking the worst-case unprotected
+window to ≤30 minutes. The 3:35 PM reconciliation remains as the final backstop, not the primary.
+
+```typescript
+// Runs each 30-min pass, before the announcement scan.
+for (const trade of await getOpenTrades()) {
+  const liveGtts = await kite.getGTTs();
+  const slLive = liveGtts.some(g => g.id === trade.slGttId && g.status === "active");
+  if (!slLive) {
+    const gtt = await placeBufferedSL(trade);     // same buffered-LIMIT helper as §14
+    await markTradeProtected(trade.id, gtt.trigger_id);
+    await sendTelegram(`🔴 ${trade.instrument.symbol} had NO live SL — replaced now. ` +
+      `Was unprotected.`);
+  }
+}
+```
+
+**Intraday breakeven (optional, recommended — see §15 Exit Policy):** on each pass, if a trade has
+touched +1R and its SL is still below entry, promote the SL to breakeven via `updateTrailingSL`.
+This only ever *reduces* risk, so it is consistent with the no-intraday-entries philosophy.
+
+**Mid-swing results alert (v5):** a results date that lands while a position is open is a known
+risk the entry-time "results < 5 days" filter cannot catch. On each pass, flag any open trade
+with a corporate result within 2 days so you can decide whether to trim or exit before the event.
 
 **Filters out:** AGM notices, routine filings, standard board meeting intimations.
 **Flags:** Pledge changes, earnings releases, promoter activity, SEBI orders,
@@ -1034,7 +1295,129 @@ Regime at entry:     Sideways (ADX 19, VIX 14.2)
 
 ## 8. Workflows
 
-### Workflow 1: Evening Scan (Daily, Automated)
+### Trader's Weekly and Daily Routine
+
+This section defines exactly what the trader does and when. The system
+automates everything it can; the trader's role is review and decision-making.
+
+#### Sunday Evening Routine (1–2 hours)
+
+```
+1. Open Watchlist → "Weekly Proposals" tab
+   - Sunday scanner ran automatically this morning
+   - Review 20–30 proposals ranked by Watchlist Score
+   - For each proposal: view weekly chart, check sector, RS vs Nifty
+
+2. Add stocks to watchlist
+   - Click Add to watchlist on promising proposals
+   - Click “Generate hypothesis” → Watchlist Hypothesis Agent drafts a 1–3 sentence structural thesis
+   - Edit the hypothesis if needed or accept as-is. Why is this stock worth watching over the next few weeks?
+   - Reject or snooze the rest
+
+3. Review existing watchlist
+   - Check Watchlist Score ↑/↓ deltas from last week
+   - Remove stocks whose weekly structure has broken down
+   - Update hypotheses if your thesis has changed
+   - Goal: end with 15–30 active watchlist stocks
+
+4. Open Weekly Review
+   - Check: win rate, avg R-multiple, drawdown
+   - Check: discipline score (% trades where hypothesis was intact at entry)
+   - Check: regime breakdown (win rate in trending vs. sideways)
+   - Note focus points for the coming week
+
+5. Open Settings (if needed)
+   - Adjust risk per trade, sector caps, loss caps based on review
+```
+
+#### Daily Evening Routine (Mon–Fri, 30–45 min after 4:00 PM)
+
+```
+1. Open Dashboard
+   - Check evening scan status: "Scan complete. X setups found."
+   - Review any trailing SL suggestions for open positions
+   - Review any target 1 hit notifications
+   - Approve or skip trailing SL / exit suggestions
+
+2. Open Candidates
+   - Review 3–8 candidates from tonight's scan
+   - Each shows: finalScore, setup type, hypothesis excerpt
+   - Click into Trade Idea Detail for deeper review
+
+3. For each candidate you want to trade:
+   - Read the agent-drafted hypothesis
+   - Edit if needed — or confirm if you agree
+   - Review: entry zone, SL, targets, quantity, sector exposure
+   - Click "Confirm Plan for Tomorrow"
+     (NO GTT placed yet — GTT is placed at 8:45 AM after morning check)
+
+4. Open Journal (if any trades closed today)
+   - Confirm entry/exit details
+   - Apply tags: followed plan, early exit, chased, hypothesis ignored
+   - Add notes
+```
+
+#### Daily Morning Routine (Mon–Fri, 5 min at 8:50 AM)
+
+```
+1. Check Telegram morning brief (arrives at 8:45 AM)
+   - GTTs placed automatically: [list with MR scores]
+   - GTTs held — review required: [list with reasons]
+   - Expired: [list]
+
+2. For held/stale setups (if any):
+   - Open app → Dashboard → Today's Plan
+   - Review the penalty reason (BSE announcement, etc.)
+   - Decide: manually place GTT (override) or skip
+
+3. No further action needed until evening
+   - GTT orders are live at Kite, executing automatically
+   - News Agent monitors every 30 minutes
+   - Postback webhook handles entry/SL execution
+```
+
+---
+
+### Workflow 0: Sunday Scanner (Weekly, Automated)
+
+Runs automatically on Sunday morning using Friday's weekly candle data.
+Produces proposals for the trader to review on Sunday evening.
+
+```
+[node-cron: Sunday 8:00 AM IST]
+        │
+        ▼
+[BullMQ: sunday-scan job]
+        │
+        ├─► Fetch weekly OHLCV for all NSE 500 via Kite Historical API
+        │       (uses Friday's weekly candle — weekly candle closes on Friday)
+        │       (batch requests, 300ms delay)
+        │
+        ├─► Compute Watchlist Score for all 500 stocks
+        │       Weekly trend strength (40%)
+        │       RS vs Nifty 3-month (30%)
+        │       Setup readiness proximity (30%)
+        │
+        ├─► Cache 20-day average volume for each stock in Redis
+        │       (used by the weekday volume-spike discovery screener)
+        │
+        ├─► Filter out:
+        │       Stocks already on active watchlist (you already have them)
+        │       Stocks with open positions (Group 1)
+        │       Stocks failing hard filters (liquidity, pledge, etc.)
+        │
+        ├─► Rank remaining stocks by Watchlist Score
+        │       Take top 20–30 as "Weekly Proposals"
+        │       Save to WeeklyProposal table with score + breakdown
+        │
+        └─► Telegram: "Sunday scan complete.
+                       X proposals ready for review.
+                       Top: [symbol list with scores]"
+```
+
+---
+
+### Workflow 1: Evening Scan (Daily Mon–Fri, Automated)
 
 ```
 [node-cron: 3:45 PM IST]
@@ -1049,20 +1432,22 @@ Regime at entry:     Sideways (ADX 19, VIX 14.2)
         ├─► Market Holiday Check
         │       If NSE holiday → log + abort
         │
-        ├─► Fetch OHLCV for NSE 500 via Kite Historical API
+        ├─► Fetch OHLCV for active watchlist stocks (Group 2) via Kite Historical API
         │       (batch requests, 300ms delay, daily + weekly candles)
+        │       Typically 20–30 stocks, not 500 — fast and cheap
         │
         ├─► Store candles in PostgreSQL
         │
-        ├─► Run Indicator Engine on all 500 symbols
+        ├─► Run Indicator Engine on all active watchlist symbols
         │       (10 indicators, daily + weekly snapshots)
         │
         ├─► Run Regime Agent
         │       → persist RegimeReport to MarketRegime table
         │
-        ├─► Run Scanner Agent
-        │       (apply all hard filters including liquidity, pledge, rebalancing)
-        │       (score every symbol → shortlist ~15–25 setups)
+        ├─► Run Scanner Agent on active watchlist stocks only
+        │       (apply all hard filters: liquidity, pledge, ex-dividend, rebalancing)
+        │       (exclude: open positions, cooldown stocks, snoozed stocks)
+        │       (score every active watchlist symbol → shortlist ~3–8 setups)
         │       (save each with status = "vision_pending")
         │
         ├─► Vision Cost Guard
@@ -1084,14 +1469,36 @@ Regime at entry:     Sideways (ADX 19, VIX 14.2)
         │         compute composite score (weekly trend 40% + RS 30% + proximity 30%)
         │         persist to WatchlistItem.watchlistScore + watchlistScoreDetail
         │
-        ├─► EOD Position Review (for all open trades)
-        │       For each open trade:
-        │         fetch daily OHLCV → detect new daily swing low above currentSL
-        │         if found → create pending TrailingSlSuggestion record
-        │         check if target1 was hit today (close >= target1)
-        │         if hit → create pending PartialExitSuggestion record
+        ├─► EOD Position Review (for all open trades — Group 1)
+        │       Staged exit logic per open trade (see §15 Exit Policy):
+        │         1. If close >= entry + 1R AND currentSL < entry:
+        │              → create BreakevenSuggestion (move SL to entry)
+        │         2. If close >= target1 (1.6R) AND not yet partially exited:
+        │              → create PartialExitSuggestion (sell EXIT_CONFIG.partialFraction)
+        │                remaining runner's SL stays at breakeven
+        │         3. Runner trail: newSL = max(last daily swing low,
+        │                                       close − atrTrailMult * ATR)
+        │              → if newSL > currentSL: create TrailingSlSuggestion
+        │         4. Time stop: if sessionsHeld >= timeStopSessions AND never hit +1R:
+        │              → create TimeStopSuggestion (exit, free the slot)
         │       All suggestions surfaced on Positions page and Dashboard
         │       Included in evening Telegram briefing
+        │
+        ├─► Watchlist Status Transitions
+        │       For each WatchlistItem with status = "cooldown":
+        │         if cooldownUntil <= today → set status = "active"
+        │       For each WatchlistItem with status = "snoozed":
+        │         if snoozeUntil <= today → set status = "active"
+        │
+        ├─► Volume-Spike Discovery Screener (NSE 500, lightweight)
+        │       Fetch today's volume for all NSE 500 from Kite quotes
+        │       Compare against 20-day average volume (cached from Sunday scan)
+        │       Flag stocks with volume > 3× average AND price move > 5%
+        │       Exclude: stocks already on watchlist, open positions
+        │       Typically surfaces 0–3 names per day
+        │       These are NOT candidates — they are discovery alerts only
+        │       → Telegram: "Volume spike alert: LTIM +7% on 3.2× volume.
+        │                    Not on your watchlist. Worth a look for Sunday?"
         │
         ├─► Run Briefing Agent (evening mode)
         │       (includes Vision summary + top watchlist score movers
@@ -1144,6 +1551,20 @@ Regime at entry:     Sideways (ADX 19, VIX 14.2)
         │       totalPenalty = sum of applicable penalties (max −40 pts)
         │       Persist to Setup.morningReadinessScore + morningScoreDetail
         │
+        ├─► Regime Gate (portfolio-level, evaluated once before per-setup loop):
+        │       regime = classifyRegime(latestRegime, niftyVs200ema)
+        │         (latestRegime = most recent MarketRegime row, classified the prior
+        │          evening; niftyVs200ema uses the prior session close. Optionally
+        │          refresh direction with SGX/pre-open before placing.)
+        │       policy = REGIME_POLICY[regime]
+        │       If !policy.allowNewLongs (risk_off):
+        │         → place NO new GTTs today
+        │         → all plan_confirmed setups → "stale_pending_review"
+        │             (reason: risk_off regime)
+        │         → Telegram: "Risk-off regime — no new longs today. N setups held."
+        │         → skip the per-setup placement loop entirely
+        │       Else: use policy.mrThreshold (not a hard-coded 50) as the bar below.
+        │
         ├─► GTT Placement Decision (per setup):
         │   │
         │   ├─► HARD VETO (BSE material announcement present)?
@@ -1153,7 +1574,7 @@ Regime at entry:     Sideways (ADX 19, VIX 14.2)
         │   │                    Reason: BSE announcement overnight.
         │   │                    Review manually before entering."
         │   │
-        │   ├─► morningReadinessScore >= 50 AND no hard veto?
+        │   ├─► morningReadinessScore >= policy.mrThreshold AND no hard veto?
         │   │       → Auto-place single-leg ENTRY GTT at Kite
         │   │           trigger: price >= entryZoneHigh
         │   │           order: BUY LIMIT, CNC, quantity from plan
@@ -1162,7 +1583,7 @@ Regime at entry:     Sideways (ADX 19, VIX 14.2)
         │   │       → Telegram: "GTT placed for [symbol].
         │   │                    Entry: ₹[price]. MR Score: [score]/100."
         │   │
-        │   └─► morningReadinessScore < 50 AND no hard veto?
+        │   └─► morningReadinessScore < policy.mrThreshold AND no hard veto?
         │           → Do NOT auto-place GTT
         │           → Setup status = "stale_pending_review"
         │           → Telegram: "GTT NOT placed for [symbol].
@@ -1183,15 +1604,20 @@ Regime at entry:     Sideways (ADX 19, VIX 14.2)
         │   and GTT placement outcomes per setup)
         │
         └─► Telegram: morning brief summary
-                "GTTs placed (2): TATAMOTORS ✓ 71pts, INFY ✓ 68pts
-                 GTTs held (1):   HDFCBANK ✗ BSE announcement — review
-                 Expired (1):     CIPLA ✗ 43pts — below threshold"
+                "GTTs placed (2):     TATAMOTORS ✓ 71pts, INFY ✓ 68pts
+                 Held for review (2): HDFCBANK ✗ BSE announcement (hard veto)
+                                      CIPLA ✗ 43pts (below threshold)"
+                 // Both held setups → status stale_pending_review. "Expired" is
+                 // reserved for the 9:15 AM gap check (opened outside entry zone),
+                 // which has not run yet at 8:45 AM.
 ```
 
 **Morning Readiness Score — penalty weights:**
 
 All three conditions use data available before market open at 9:15 AM IST.
 Penalties are subtracted from finalScore (not multiplied). Max combined penalty: −40 pts.
+The placement bar is `policy.mrThreshold` from the regime gate above — 50 in `risk_on`, 60 in
+`neutral`, and unreachable in `risk_off` (no new longs). The examples below assume `risk_on` (50).
 
 | Condition | Penalty | Veto type | Data source |
 |---|---|---|---|
@@ -1409,10 +1835,17 @@ are the News Agent (30-min polling) and the Kite GTT postback webhook
         ▼
 [Identify trade by slGttId]
         │
-        ├─► Update Trade: status = "closed", exitPrice, exitDate, exitReason = "stoploss"
-        ├─► Create TradeExit record
+        ├─► Create TradeExit record for the final leg (quantity = remaining Trade.quantity)
+        ├─► Update Trade: status = "closed" (closing from "open" OR "partial"),
+        │       exitDate, exitReason = "stoploss" (or "breakeven" if SL was at entry),
+        │       realizedPnl = SUM of all TradeExit legs (not a single full-size exit)
         ├─► Recalculate portfolio heat
-        └─► Telegram: "[symbol] SL hit at ₹[price]. −[R]R. Trade closed."
+        ├─► Watchlist transition: WatchlistItem.status = "cooldown"
+        │       cooldownUntil = tomorrow (next trading day)
+        │       Stock returns to active watchlist after 1-day cooldown
+        │       Prevents revenge-trading the same stock tonight
+        └─► Telegram: "[symbol] SL hit at ₹[price]. −[R]R. Trade closed.
+                       Stock returns to watchlist tomorrow."
 ```
 
 ---
@@ -1554,6 +1987,10 @@ the Plan Agent calculates portfolio heat for new positions.
 | `POST` | `/api/agent/chat` | Chat with agent about any stock |
 | `GET` | `/api/agent/review` | Get latest journal review |
 | `POST` | `/api/agent/morning-score` | Recompute Morning Readiness Score on demand |
+| `POST` | `/api/agent/sunday-scan` | Trigger Sunday scanner manually |
+| `GET` | `/api/watchlist/proposals` | Get current week's proposals from Sunday scan |
+| `POST` | `/api/watchlist/proposals/:id/accept` |  Accept proposal → add to watchlist, run Watchlist Hypothesis Agent to draft structural thesis, return hypothesis for inline editing before save |
+| `POST` | `/api/watchlist/proposals/:id/reject` | Reject proposal |
 | `GET` | `/api/kite/auth` | Initiate Kite login flow |
 | `GET` | `/api/kite/callback` | Handle Kite OAuth callback + persist token |
 | `POST` | `/api/kite/gtt/place` | Place entry GTT manually (override or fallback) |
@@ -1796,6 +2233,11 @@ export interface IndicatorSnapshot {
 
 The `computeAllIndicators` function accepts a `timeframe` parameter. The EOD scan now calls it twice per symbol — once with daily candles (`"day"`) and once with weekly candles (`"week"`). The weekly snapshot is stored in `Setup.weeklySnapshot` and passed to the Plan Agent for additional context.
 
+**RS lookback (v5 clarification):** `momentum.rsVsNifty` is the ratio of the stock's return to
+Nifty's over a **fixed 63-trading-day (~3-month) window** (`stockReturn / niftyReturn`, > 1.0 =
+outperforming). The Watchlist Score (§15) and `momentumScore` both read this field, so the
+lookback must be defined in one place in the engine and not recomputed ad hoc per consumer.
+
 ---
 
 ## 13. Vision AI Ratification Layer
@@ -1970,7 +2412,7 @@ The `/scanner/:id` page shows three cards:
 | Order Type | When Used | How |
 |---|---|---|
 | `GTT` (Good-Till-Triggered) | Entry orders placed after market hours | `kite.placeGTT()` |
-| `GTT` | Stop-loss orders | `kite.placeGTT()` — one-cancels-other |
+| `GTT` | Stop-loss orders | `kite.placeGTT()` — single-leg, buffered LIMIT on trigger |
 | `LIMIT` | Intraday entry during market hours | `kite.placeOrder()` |
 | `SL-M` | Panic exit if SL breached with no GTT | `kite.placeOrder()` |
 
@@ -2022,8 +2464,19 @@ a stop loss is the only unrecoverable failure mode in the system.
 async function handleEntryExecution(plan: TradePlan, filledPrice: number) {
 
   // STEP 1 — FIRST: place SL GTT before anything else
+  //
+  // IMPORTANT (v5): Kite GTT does NOT support market orders — it places a LIMIT
+  // order when the trigger fires (verified against Zerodha GTT docs). A LIMIT set
+  // AT the trigger price rests unfilled on a gap-down THROUGH the trigger, leaving
+  // the position unprotected — the single worst failure mode in the system. Set the
+  // SL limit well BELOW the trigger so it fills through moderate gaps like a market
+  // order, while still capping the worst fill (flash spike / fat-finger print).
+  // A catastrophic gap can still slip — that residual risk is sized for, not removed
+  // (§20.2). plan.atr14 is persisted on the TradePlan from the entry snapshot.
   let slGttId: string | null = null;
   try {
+    const slBuffer = Math.max(2.5 * plan.atr14, plan.stopLoss * 0.01);
+    const slLimitPrice = +(plan.stopLoss - slBuffer).toFixed(2);
     const response = await kite.placeGTT({
       trigger_type: "single",
       tradingsymbol: plan.instrument.symbol,
@@ -2034,8 +2487,8 @@ async function handleEntryExecution(plan: TradePlan, filledPrice: number) {
         transaction_type: "SELL",
         quantity: plan.quantity,
         product: "CNC",
-        order_type: "MARKET",
-        price: 0,
+        order_type: "LIMIT",
+        price: slLimitPrice,
       }],
     });
     slGttId = response.trigger_id;
@@ -2065,6 +2518,12 @@ async function handleEntryExecution(plan: TradePlan, filledPrice: number) {
     );
     return; // exit early — DB and Telegram handled above
   }
+
+  // STEP 1b: Move stock from watchlist "active" to "in_trade"
+  await prisma.watchlistItem.updateMany({
+    where: { instrumentId: plan.instrumentId, status: "active" },
+    data: { status: "in_trade" }
+  });
 
   // STEP 2: SL GTT placed successfully — update DB
   await prisma.trade.create({
@@ -2110,7 +2569,11 @@ async function updateTrailingSL(trade: Trade, newSL: number, currentPrice: numbe
   // Cancel existing SL GTT
   await kite.deleteGTT(trade.slGttId!);
 
-  // Place new SL GTT at higher trailing level
+  // Place new SL GTT at higher trailing level.
+  // Buffered LIMIT (Kite GTT = limit-on-trigger; same rationale as placeEntryGTT's
+  // SL leg). trade.atr14 is kept current from the latest daily snapshot.
+  const slBuffer = Math.max(2.5 * trade.atr14, newSL * 0.01);
+  const slLimitPrice = +(newSL - slBuffer).toFixed(2);
   const response = await kite.placeGTT({
     trigger_type: "single",
     tradingsymbol: trade.instrument.symbol,
@@ -2121,8 +2584,8 @@ async function updateTrailingSL(trade: Trade, newSL: number, currentPrice: numbe
       transaction_type: "SELL",
       quantity: trade.quantity,
       product: "CNC",
-      order_type: "MARKET",
-      price: 0,
+      order_type: "LIMIT",
+      price: slLimitPrice,
     }],
   });
 
@@ -2215,6 +2678,122 @@ process.on("SIGINT", () => {
 ---
 
 ## 15. Scoring Reference
+
+### Indicator (Confidence) Score (0–100, computed per setup at scan time)
+
+Answers: **"How strong is this specific entry setup on the numbers alone, before Vision?"**
+
+This is the load-bearing number: `finalScore = computeFinalScore(indicatorScore, visionScore)`
+(§7 Agent 2b). It is a **pure function** of the indicator snapshot — no model, no I/O — so it is
+fully backtestable and reproducible. It is **setup-type-weighted** because a breakout and a
+pullback want opposite things from the same indicators (a breakout wants volume *expanding*; a
+pullback wants it *contracting*). The weight table below is the first concrete draft of the
+per-setup rule spec required by §20.5.
+
+```typescript
+// src/scoring/indicator-score.ts — PURE, backtestable, no model/IO.
+
+type SetupType = "breakout" | "pullback_ema" | "inside_bar" | "hh_hl" | "rs_breakout";
+
+interface SubScores {
+  trend: number; momentum: number; volatility: number; volume: number; structure: number;
+}
+
+// Weights per setup type — encode the §20.5 rule spec. SEED VALUES — backtest before trusting.
+const WEIGHTS: Record<SetupType, SubScores> = {
+  breakout:     { trend: 0.30, momentum: 0.15, volatility: 0.20, volume: 0.25, structure: 0.10 },
+  pullback_ema: { trend: 0.35, momentum: 0.20, volatility: 0.15, volume: 0.10, structure: 0.20 },
+  inside_bar:   { trend: 0.30, momentum: 0.15, volatility: 0.25, volume: 0.15, structure: 0.15 },
+  hh_hl:        { trend: 0.40, momentum: 0.15, volatility: 0.10, volume: 0.15, structure: 0.20 },
+  rs_breakout:  { trend: 0.25, momentum: 0.30, volatility: 0.15, volume: 0.20, structure: 0.10 },
+};
+
+function trendScore(s: IndicatorSnapshot): number {
+  let x = 0;
+  const t = s.trend;
+  if (t.ema20 > t.ema50 && t.ema50 > t.ema200) x += 40;      // full stack
+  else if (t.ema20 > t.ema50) x += 20;                        // partial
+  x += Math.min(30, (Math.min(t.adx, 40) / 40) * 30);         // ADX 25+ = trending
+  if (t.macdHist > 0) x += 15;
+  if (t.supertrend.direction === "up") x += 15;
+  return Math.min(100, x);
+}
+
+function momentumScore(s: IndicatorSnapshot, setup: SetupType): number {
+  const rsi = s.momentum.rsi14;
+  // Pullbacks want a COOLED rsi (45–55); breakouts want rising strength (55–68).
+  const ideal = setup === "pullback_ema" ? [45, 55] : [55, 68];
+  let rsiPts: number;
+  if (rsi >= ideal[0] && rsi <= ideal[1]) rsiPts = 60;
+  else if (rsi > 70) rsiPts = 15;                              // overbought — chasing
+  else if (rsi < 40) rsiPts = 5;                               // no momentum
+  else rsiPts = 35;
+  const rs = s.momentum.rsVsNifty;
+  const rsPts = Math.max(0, Math.min(40, ((rs - 0.9) / 0.3) * 40)); // RS≥1.2 → 40
+  return Math.min(100, rsiPts + rsPts);
+}
+
+function volatilityScore(s: IndicatorSnapshot, setup: SetupType): number {
+  const w = s.volatility.bbWidth;
+  // Breakout / inside_bar want COMPRESSION before expansion; trends tolerate more.
+  const wantsCompression = setup === "breakout" || setup === "inside_bar";
+  const compPts = wantsCompression
+    ? Math.max(0, Math.min(70, ((0.08 - w) / 0.08) * 70))      // tighter = higher
+    : 35;
+  const atrSane = s.volatility.atrPercent >= 1 && s.volatility.atrPercent <= 4 ? 30 : 10;
+  return Math.min(100, compPts + atrSane);
+}
+
+function volumeScore(s: IndicatorSnapshot, setup: SetupType): number {
+  const v = s.volume.volumeRatio;
+  // Breakouts want expansion (>1.5×); pullbacks want contraction (<1×).
+  let pts: number;
+  if (setup === "pullback_ema" || setup === "inside_bar")
+    pts = v < 1.0 ? 70 : v < 1.3 ? 40 : 15;                    // dry-up is good
+  else
+    pts = v >= 1.8 ? 70 : v >= 1.3 ? 45 : 15;                  // thrust is good
+  if ((s.volume.deliveryPercent ?? 0) > 50) pts += 30;        // real buying, not churn
+  return Math.min(100, pts);
+}
+
+function structureScore(s: IndicatorSnapshot, close: number): number {
+  // Headroom from the CURRENT price: room up to resistance vs. room down to support.
+  // Pass the latest close — the snapshot has no absolute price field, so do NOT use
+  // lastSwingHigh as a price stand-in (it skews headroom whenever price != that swing).
+  const px = s.structure;
+  const toRes = px.nearestResistance - close;
+  const toSup = close - px.nearestSupport;
+  const ratio = toSup > 0 ? toRes / toSup : 0;
+  const headroom = Math.max(0, Math.min(60, ratio * 30));        // ratio 2 → 60
+  const nearEntry = Math.abs(px.priceVsEma20Pct) < 3 ? 40 : 15;  // not extended
+  return Math.min(100, headroom + nearEntry);
+}
+
+export function computeIndicatorScore(
+  s: IndicatorSnapshot, setup: SetupType, close: number
+): number {
+  const w = WEIGHTS[setup];
+  const sub: SubScores = {
+    trend:      trendScore(s),
+    momentum:   momentumScore(s, setup),
+    volatility: volatilityScore(s, setup),
+    volume:     volumeScore(s, setup),
+    structure:  structureScore(s, close),
+  };
+  return Math.round(
+    sub.trend * w.trend + sub.momentum * w.momentum +
+    sub.volatility * w.volatility + sub.volume * w.volume +
+    sub.structure * w.structure
+  );
+}
+```
+
+The Scanner Agent stores the five sub-scores alongside the composite in `Setup.indicatorData`
+so the UI can show *why* a setup scored what it did (not just the number). **Do not trust the
+absolute value until the weights and thresholds are backtested** (§20.6) — but the orthogonal
+structure is correct and will not change.
+
+---
 
 ### Watchlist Score (0–100, computed every evening)
 
@@ -2313,6 +2892,75 @@ export const STALENESS_PENALTIES = {
 // The actual opening gap check (price opened outside entry zone) is handled by
 // the News Agent first pass at 9:15 AM using real Kite LTP data — not here.
 ```
+
+---
+
+### Exit Policy (breakeven + partial + trail)
+
+Exits are where swing edge is won or lost. v4 had only a loose "new swing low" trail and an
+undefined partial fraction — which lets a trade run to +2R intraday, reverse, and stop at the
+original −1R. The staged policy below (driven from the EOD position review, Workflow 1) closes
+that leak. Each step produces a suggestion you approve; nothing executes unattended.
+
+```typescript
+// src/scoring/exit-policy.ts — SEED config, backtest the numbers.
+export const EXIT_CONFIG = {
+  breakevenAtR: 1.0,        // at +1R, move SL to entry
+  partialAtR: 1.6,          // T1 = 1.6R
+  partialFraction: 0.5,     // sell 50% at T1
+  runnerTrail: "max_of",    // max(last swing low, close − k·ATR)
+  atrTrailMult: 2.5,
+  timeStopSessions: 10,     // if not +1R within 10 sessions → flag exit
+} as const;
+```
+
+Lifecycle on an open trade:
+
+1. **+1R reached → SL to breakeven.** Removes the "ran to +2R, stopped at −1R" disaster.
+2. **T1 (1.6R) hit → sell `partialFraction`.** The remaining runner's stop is at breakeven —
+   you are now risk-free on it.
+3. **Runner trails** at `max(lastSwingLow, close − 2.5·ATR)` — the wider stop holds, so a single
+   sharp candle doesn't shake you out.
+4. **Time stop:** no +1R within `timeStopSessions` → exit and free the slot (you cap at 8 live
+   positions; dead trades cost you live setups).
+
+**Execution of a partial exit — the SL GTT MUST be resized (critical).** A partial sell leaves
+the runner held at a *smaller* quantity, but the SL GTT placed on entry still covers the **full
+original quantity**. If it is not resized, a later SL trigger tries to SELL more shares than you
+hold → Kite rejects or partial-fills → **the runner is unprotected.** The partial-exit handler
+must therefore, in order:
+
+```typescript
+async function executePartialExit(trade: Trade, exitQty: number, exitPrice: number) {
+  // 1. Sell the partial leg (intraday LIMIT/market sell of exitQty).
+  await placeSell(trade, exitQty, exitPrice);
+  // 2. Cancel the old full-size SL GTT FIRST (avoid an oversized stop sitting live).
+  await kite.deleteGTT(trade.slGttId!);
+  // 3. Re-place the SL GTT for the REMAINING quantity, at breakeven (buffered LIMIT, §14).
+  const remainingQty = trade.quantity - exitQty;
+  const newSl = await placeBufferedSL({ ...trade, quantity: remainingQty,
+                                        stopLoss: trade.entryPrice }); // breakeven
+  // 4. Record the leg and update the trade to a partial, protected state.
+  await prisma.tradeExit.create({ data: { tradeId: trade.id, quantity: exitQty,
+    exitPrice, exitReason: "target1", realizedPnl: (exitPrice - trade.entryPrice) * exitQty }});
+  await prisma.trade.update({ where: { id: trade.id },
+    data: { quantity: remainingQty, currentSL: trade.entryPrice,
+            slGttId: newSl.trigger_id, status: "partial" }});
+}
+```
+
+When the runner's SL (or a later target) finally fires, `handleSLExecution` must close **from
+`partial`**, size the final leg to the *remaining* `quantity`, and compute realized P&L by
+**aggregating all `TradeExit` legs** — not by assuming a single full-size exit.
+
+**EOD-philosophy decision — breakeven timing.** +1R can be touched *intraday* and reverse before
+the close; an EOD-only breakeven move won't catch it. Two options:
+
+- **Strict EOD** — breakeven moves only on a *close* ≥ +1R. Fully consistent with the
+  no-intraday-action philosophy; gives back intraday spikes.
+- **Intraday risk-only (recommended)** — the News Agent's existing 30-min pass promotes the SL
+  to breakeven the moment price *touches* +1R. This does not violate "no intraday entries" — you
+  only ever *reduce* risk, never open. See §7 Agent 4.
 
 ---
 
@@ -2505,7 +3153,10 @@ Goal: Fetch data, compute 10 indicators, see them working correctly.
 ### Phase 2 — Scanner + Vision + Plan Agent + Hypothesis (Weeks 3–6)
 Goal: Agent finds setups, Vision ratifies them, hypothesis is drafted, you confirm in the evening.
 
-- [ ] Scanner Agent with 3 setup types + all hard filters (liquidity, pledge, ex-dividend, rebalancing)
+- [ ] Sunday scanner — NSE 500 Watchlist Score computation + Weekly Proposals
+- [ ] Scanner Agent (watchlist only on weekdays) with 3 setup types + all hard filters (liquidity, pledge, ex-dividend, rebalancing)
+- [ ] WatchlistItem status lifecycle (active / in_trade / cooldown / snoozed)
+- [ ] Volume-spike discovery screener (NSE 500, daily, alert-only)
 - [ ] Setup storage and scanner results page
 - [ ] Candlestick + volume chart renderer (model-agnostic PNG)
 - [ ] Vision model evaluation — label 30–50 setups manually, test Gemini Flash, GPT-4o, Claude Sonnet
@@ -2602,6 +3253,15 @@ Candlestick pattern recognition is the primary value Vision adds over indicators
 **Why the watchlist score runs every evening, not just on Sundays?**
 A stock's setup proximity changes daily. A stock that was 40 points on the watchlist score yesterday may jump to 78 today because BB compression hit its tightest point in 6 months. Catching this the evening it happens — not a week later — is the entire value of the watchlist score.
 
+**Why does the daily scanner scan the watchlist only, not the full NSE 500?**
+Scanning 500 stocks daily sounds comprehensive but is counterproductive. It surfaces 15–25 candidates per evening instead of 3–8, overwhelming the trader with noise. Most mid-week setups on stocks outside the curated watchlist lack structural context — no weekly thesis, no understanding of the sector dynamics, no conviction. The win rate on watchlist stocks will be higher because you have context. The full NSE 500 scan runs on Sunday to discover new structural candidates for the week. A lightweight volume-spike screener catches genuine mid-week exceptions (3× volume, 5%+ move) as discovery alerts — not candidates — prompting you to consider adding them for next week.
+
+**Why a 1-day cooldown after a trade closes?**
+When a stop loss is hit, the emotional impulse is to re-enter the same stock the same evening — "the setup is still valid, I just got stopped out on noise." This is revenge trading, and it is one of the most common retail mistakes. A 1-day cooldown forces the stock to spend at least one full session forming new price action before the scanner evaluates it again. If the setup is genuinely still valid, it will show up tomorrow. If it was noise, the cooldown saved you from a second loss.
+
+**Why are open positions excluded from the scanner?**
+If you are already long TATAMOTORS, the scanner finding another "pullback to EMA 20" setup on TATAMOTORS tonight is meaningless — you already own it. Worse, it is confusing: the trader sees a candidate for a stock they hold, wonders if they should add to the position, and the system was never designed for pyramiding. Open positions are managed by the EOD position review (trailing SL, target assessment), not the setup scanner.
+
 **Why GTT orders over WebSocket-triggered orders?**
 SEBI's position on retail algo trading is nuanced — placing orders automatically via API without an exchange-approved algorithm creates regulatory exposure. GTT orders are exchange-managed and widely used by retail traders without requiring algo registration.
 
@@ -2619,3 +3279,225 @@ During market hours you may not have the app open. Telegram delivers to your pho
 
 **Why the token lifecycle worker is critical?**
 Zerodha access tokens expire every day at 6:00 AM IST. Without an automated check, the system goes blind every single morning. Every job that touches Kite checks the Redis flag `kite:token:valid` before executing. The system is designed to fail loudly and early rather than silently operate on stale data.
+
+---
+
+## 20. Risk Policy & Performance Targets
+
+This section centralizes all risk, concurrency, directionality, backtest, and performance assumptions so that every agent, backtest, and UI component uses the same source of truth. No agent or job is allowed to hardcode risk parameters.
+
+### 20.1 Directionality Assumptions
+
+- **Current scope (v1):** Long‑only CNC swing trades on NSE cash equities.
+- **Shorts:** Short swing trades (via F&O) are explicitly **out of scope** for v1. They will be added only after:
+  - Separate risk limits for shorts are defined (likely lower per‑trade risk and lower heat caps).
+  - A clear playbook for short setups (breakdowns, failed breakouts, mean‑reversion shorts) is written and backtested.
+- **Config (conceptual):**
+  - `ENABLE_LONGS = true`
+  - `ENABLE_SHORTS = false`
+  - `DEFAULT_SHORT_RISK_MULTIPLIER = 1.0` (no effect until shorts are enabled)
+
+The Strategy Lab may still experiment with short‑side ideas, but the live Plan Agent and order‑placement workflows must respect `ENABLE_SHORTS`.
+
+---
+
+### 20.2 Risk Configuration (R, per‑trade risk, and caps)
+
+All risk is expressed in terms of **R** (1R = planned loss if SL is hit) and as a percentage of current equity.[web:2]
+
+The following configuration lives in a single risk config module (e.g. `RISK_CONFIG`):
+
+- **Risk per trade (to be filled later):**
+  - `RISK_PER_TRADE_PCT` — percentage of account equity risked on each trade.
+  - This is a **single global number** (e.g. 0.75–1.0) and is used by Plan Agent for position sizing and by Strategy Lab for simulation.[web:2]
+  - v1: leave as TODO in code and set explicitly once you are comfortable.
+
+- **Portfolio heat (open risk cap):**
+  - **Definition:** Sum of per‑trade risk as % of equity across all open trades.[web:18][web:19]
+  - `MAX_PORTFOLIO_HEAT_PCT = 6`
+    - Example: 6 open trades at 1R (1% each) → 6% worst‑case “all stops hit” loss.
+  - If a new trade would push portfolio heat above this cap, Plan Agent must:
+    - Either refuse the plan, or
+    - Automatically reduce quantity to keep heat ≤ 6%, and flag the trade as “heat‑capped”.
+
+- **Portfolio-heat caveat — stops are not independent (v5):** the 6% "worst case" assumes every
+  stop fills at its trigger and trades are uncorrelated. On a correlated market gap-down — the
+  exact day long swings hurt together — correlations approach 1 *and* stops gap *through* their
+  triggers (§14), so realized loss can exceed 6%. Treat 6% as a fair-weather figure. Eight long
+  high-beta positions are effectively one leveraged bet on market beta; the regime gate (§7
+  Agent 1) is the primary control here — it cuts exposure before the correlated day arrives.
+
+- **Loss caps (to be filled later):**
+  - `DAILY_LOSS_CAP_R` — e.g. 3R (stop new risk for the day once cumulative realized + open loss reaches −3R).
+  - `WEEKLY_LOSS_CAP_R` — e.g. 6R.
+  - `MONTHLY_LOSS_CAP_R` — e.g. 10–12R.
+  - **Behavior:** When a cap is hit:
+    - No new `plan_confirmed` statuses are allowed for that period.
+    - Existing trades can still be managed (SL tightening, partial exits) but not scaled up.
+
+- **Loss‑cap mode:**
+  - `LOSS_CAP_MODE = "block_new_plans"` by default.
+  - A stricter option `"block_all_new_risk"` can later be used to block scaling in or adding any exposure until the next period.
+
+All agents that create or modify trades (Plan Agent, Strategy Lab, Journal Agent for retro‑simulations) must **read** these values, never hardcode them.
+
+---
+
+### 20.3 Portfolio Concurrency (max positions and setups)
+
+To keep cognitive and operational load manageable, concurrency is bounded even if heat is technically under the cap.[web:18][web:24]
+
+**Config:**
+
+- `MAX_OPEN_POSITIONS = 8`
+  - Hard cap on the number of simultaneous open trades.
+  - This remains binding even if portfolio heat is below `MAX_PORTFOLIO_HEAT_PCT`.
+- `MAX_ACTIVE_SETUPS = 10`
+  - Maximum number of setups in “risk‑on” states (`plan_confirmed` or `gtt_placed`).
+  - Prevents spreading attention across too many “almost trades”.
+
+**Rules:**
+
+- Plan Agent must refuse new plan confirmations that would violate either cap.
+- The Sunday watchlist process is unaffected by these caps; they apply only to **live risk** and **near‑term risk** (confirmed plans and live GTTs).
+
+Sector-level caps apply via `get_portfolio_heat_by_sector`, but **sector labels under-count true
+correlation (v5):** Auto + Auto-ancillary + Tyres move together; PSU banks move together; a book
+of high-beta momentum names is one correlated cluster regardless of sector. v1 ships with the
+sector cap only, but the Plan Agent should additionally flag when a new position would push a
+*correlated theme cluster* (not just a GICS sector) past the cap. A full theme/beta-cluster cap
+is a fast-follow once the sector cap is in place.
+
+---
+
+### 20.4 Backtest Universe & Data Assumptions
+
+Backtesting and Strategy Lab must work off clearly defined data assumptions.[web:7]
+
+- **Universe (v1):**
+  - Backtests use **today’s NSE 500 constituents applied historically** (i.e. current membership only).
+  - This is simpler to implement but introduces **survivorship bias**: stocks that were delisted or performed poorly and left the index are excluded, so long‑term backtest results will look better than real‑time trading would have.[web:7]
+  - This is acceptable for early iteration, but the blueprint explicitly acknowledges this limitation.
+
+- **Universe mode (future option):**
+  - A future `historical_membership` mode can reconstruct index membership by date to remove survivorship bias.
+
+- **Corporate actions:**
+  - All OHLCV series used by indicators, backtests, and Strategy Lab must be **corporate‑action‑adjusted** (splits, bonuses, major dividends).
+  - Stop‑loss, target, and R metrics in backtests are computed on adjusted prices, consistent with live trading data.
+
+- **Costs and slippage (to be filled later):**
+  - `COST_PCT_PER_SIDE` — per‑side transaction cost as % of notional (brokerage + taxes + fees).
+  - `ENTRY_SLIPPAGE_PCT`, `EXIT_SLIPPAGE_PCT` — slippage assumptions (e.g. 0.10–0.20% per side).
+  - All Strategy Lab results (CAGR, drawdown, R distribution) must be reported **after** costs and slippage.
+
+These assumptions must be documented in the Strategy Lab UI so backtest outputs are never misinterpreted as “pure edge.”
+
+---
+
+### 20.5 Strategy Definition & Versioning
+
+Each setup type is defined not just by an English description but by a **formal rule spec** that can be versioned and tested.[web:7]
+
+- For each `setupType` (e.g. `breakout`, `pullback_ema`, `inside_bar`, `rs_breakout`), define:
+  - Trend prerequisites (e.g. EMA alignment, ADX thresholds).
+  - Pattern conditions (length of consolidation, volatility contraction, acceptable gaps).
+  - Stop‑loss rule (swing low vs pattern low, ATR multiples, etc.).
+  - Minimum required R:R (e.g. plan rejected if projected R:R < 1.5).
+
+- **Versioning:**
+  - Attach a `strategy_version` (e.g. `pullback_ema_v1`) to each `Setup` or store it in `indicatorData`/`weeklySnapshot`.
+  - When rules are changed, increment the version so backtests and live data remain comparable.
+
+- **Plan Agent use:**
+  - Plan Agent uses the rule spec as a hard constraint.
+  - LLM reasoning is allowed to **explain** the plan and compose the hypothesis, but cannot violate rule constraints (e.g. cannot propose R:R < minimum, cannot place stops inside pattern noise).
+
+This turns the blueprint from “agent that helps me think” into a “codified, testable playbook” with versions.
+
+---
+
+### 20.6 Strategy Lab Validation Principles
+
+Strategy Lab is responsible for validating strategies against historical data in a way that minimizes overfitting.[web:4][web:7][web:13]
+
+**Core principles:**
+
+- **Single simulation engine:**
+  - Strategy Lab reuses the same trade‑simulation logic as live trading:
+    - GTT‑style entries and exits.
+    - Partial exits and trailing SLs.
+    - Portfolio heat, risk per trade, and concurrency caps.
+  - The only difference is that decisions are made on historical bars instead of live data.
+
+- **Validation modes:**
+  - **Single‑instrument tests** for pattern exploration and debugging.
+  - **Portfolio tests** on the fixed NSE‑500 universe for realistic performance estimates.
+  - **Walk‑forward analysis:**
+    - Optimize parameters on a training window.
+    - Test them on the next, unseen window.
+    - Slide the window forward and repeat.[web:4][web:10][web:13]
+  - Report metrics separately for in‑sample and out‑of‑sample segments.
+
+- **Key metrics:**
+  - Win rate and average R.
+  - Max drawdown and drawdown duration.
+  - Risk‑adjusted returns (CAGR, simple Sharpe/Sortino) at the **portfolio** level.
+  - Distribution of R per setup type and per Vision score decile (e.g. 0–20, 20–40, …, 80–100).
+
+- **Parameter robustness:**
+  - Strategy Lab should support parameter sweeps (e.g. RSI bands 40–60 vs 45–55 vs 50–60) and present performance as heatmaps.
+  - If small parameter changes produce large performance swings, the strategy is flagged as “fragile/likely overfit.”
+
+Only strategies that meet or exceed the **Performance Targets** (below) on out‑of‑sample and walk‑forward tests are candidates for live deployment.
+
+---
+
+### 20.7 Journal & Discipline Enhancements
+
+The Journal system already captures setup correctness, entry/exit quality, and hypothesis integrity. This section adds explicit support for **override tracking** and **psychological tags**.[file:1][web:9][web:15]
+
+- **Override tracking:**
+  - Any time the trader overrides the system (examples):
+    - Places a GTT for a setup marked `stale_pending_review`.
+    - Ignores a strong news veto.
+    - Disagrees with a trailing‑SL suggestion.
+  - The action is logged with:
+    - `override_type` (e.g. `override_stale`, `override_news_veto`, `override_trailing_sl`).
+    - `override_reason` (free‑text).
+  - Later, Journal Agent can compare performance of “followed system” vs “overridden system”.
+
+- **Psychological tags:**
+  - Add a small controlled vocabulary of emotion/behavior tags, e.g.:
+    - `FOMO_chase`, `fear_of_giving_back`, `revenge_trade`, `hesitation`, `boredom_trade`.
+  - The trader can apply these tags when reviewing closed trades.
+  - Journal Agent aggregates:
+    - Win rate and R distribution by psychological tag.
+    - Frequency of each tag by market regime (e.g. more boredom trades in sideways markets).
+
+- **Discipline metrics:**
+  - Extend weekly and monthly reviews to include:
+    - % of losing trades where hypothesis was **not** intact at entry.
+    - % of trades where a loss‑cap or heat rule was ignored.
+    - P&L of overridden trades vs non‑overridden trades.
+
+This turns the journal into a **behavioral feedback loop**, not just a log of trades.
+
+---
+
+### 20.8 Performance Targets
+
+All design and validation decisions are anchored to explicit performance targets. These are **targets**, not guarantees, and must be evaluated over a sufficiently large sample.[web:7]
+
+- **Targets:**
+  - Win rate: **40–50%**.
+  - Average R multiple: around **2R** on winners.
+  - Typical max drawdown: **≤ 10%** of equity.
+  - Hard drawdown line: **≤ 15%**; breaching this triggers a full strategy and behavior review.
+
+- **Minimum sample size for evaluation:**
+  - At least **100 trades** per strategy configuration before making strong inferences.
+
+Strategy Lab and Journal Agent should surface current rolling performance vs these targets in the Weekly Review so you always know whether real trading is tracking the design intent.
+
+---
